@@ -24,7 +24,7 @@ class ResidualStreamReplacementIntervention:
             raise ValueError(
                 f"x ({self.x}) cannot be greater than max_new_tokens ({max_new_tokens})"
             )
-        nasty_add_on =  "value z = "
+        add_on =  "value z = "
         # Tokenize prompts to get their lengths
         original_ids = self.model.tokenizer(
             original_prompt, add_special_tokens=True, return_tensors="pt"
@@ -33,7 +33,7 @@ class ResidualStreamReplacementIntervention:
             self.diff_prompt, add_special_tokens=True, return_tensors="pt"
         ).input_ids
         add_ids = self.model.tokenizer(
-            nasty_add_on, add_special_tokens=False, return_tensors="pt"
+            add_on, add_special_tokens=False, return_tensors="pt"
         ).input_ids
         original_prompt_len = original_ids.shape[1]
         diff_prompt_len = diff_ids.shape[1]
@@ -62,11 +62,11 @@ class ResidualStreamReplacementIntervention:
         print(f"Extracting from diff_prompt + first {self.x} generated tokens")
 
         # Build diff context with first x generated tokens
-        diff_context = self.diff_prompt + generated_text + nasty_add_on
+        diff_context = self.diff_prompt + generated_text + add_on
         print(f"Diff context: {diff_context}")
         print(f"Extracting at positions [{diff_prompt_len}:{end_plan_idx}]")
 
-        residual_acts = self._extract_residual_activations(diff_context, diff_prompt_len)
+        residual_acts, phase2_logits = self._extract_residual_activations(diff_context, diff_prompt_len)
         print(f"Extracted activations from {len(residual_acts)} layers")
         print(f"Keys in residual_acts: {list(residual_acts.keys())}")
         if len(residual_acts) > 0:
@@ -77,15 +77,19 @@ class ResidualStreamReplacementIntervention:
         else:
             raise RuntimeError("Failed to extract residual activations - dict is empty")
 
+        # Visualize logits from Phase 2 (last layer residuals → norm → lm_head)
+        print(f"\n=== Phase 2 Logits: Top-5 predictions per position ===")
+        self._plot_phase2_logits(phase2_logits, output_tokens[0], original_prompt_len)
+
         # Phase 3: Generate remaining tokens with residual patching (single remote call)
         if max_new_tokens > self.x:
-            remaining_tokens = max_new_tokens - self.x
+            remaining_tokens = max_new_tokens - self.x - add_prompt_len
             print(f"\n=== Phase 3: Patching generation ({remaining_tokens} tokens) ===")
             print(f"Patching at FIXED positions [{original_prompt_len}:{end_plan_idx}]")
             print()
 
             # Decode current tokens to use as prompt
-            prompt_with_generated = original_prompt + generated_text + nasty_add_on
+            prompt_with_generated = original_prompt + generated_text + add_on
             num_layers = self.num_layers
 
             # Get the actual token length of the prompt we're sending
@@ -99,14 +103,15 @@ class ResidualStreamReplacementIntervention:
                     for i in range(self.x + add_prompt_len):
                         self.model.model.layers[layer_idx].output[0][:, i+original_prompt_len, :] = residual_acts[layer_idx][0, i]
                 
-            with self.model.generate(prompt_with_generated, max_new_tokens=2, remote=REMOTE) as tracer:
-                output = self.model.generator.output.save()
+            with self.model.generate(prompt_with_generated, max_new_tokens=remaining_tokens, remote=REMOTE) as tracer:
                 # Save logits from each generation step
                 logits_list = list().save()
-                with tracer.all():
+                with tracer.iter[0]:
                     # Get logits directly from lm_head output
-                    step_logits = self.model.lm_head.output[:, -1, :].save()
+                    step_logits = self.model.output.logits[:, -1, :].save()
                     logits_list.append(step_logits)
+                
+                output = self.model.generator.output.save()
 
             output_tokens = output
             patched_text = self.model.tokenizer.decode(output_tokens[0][end_plan_idx-5:], skip_special_tokens=False)
@@ -138,7 +143,9 @@ class ResidualStreamReplacementIntervention:
 
     # Print and plot top 5 token probabilities per generated position.
     def _print_top_logit_probs_from_logits(self, logits_list, output_tokens, prompt_len: int):
+        
         import matplotlib.pyplot as plt
+        
         # Collect data for visualization
         all_positions_data = []
 
@@ -192,6 +199,8 @@ class ResidualStreamReplacementIntervention:
 
     # Plot top 5 token probabilities as bar charts.
     def _create_logit_probs_plot(self, positions_data: list):
+        import matplotlib.pyplot as plt
+
         if len(positions_data) == 0:
             print("No data to visualize")
             return
@@ -245,6 +254,32 @@ class ResidualStreamReplacementIntervention:
         print(f"\n  Visualization saved to: {output_path}")
         plt.show()
 
+    # Print Phase 2 logits: token (tok1, prob1), (tok2, prob2)...(tok5, prob5) per position.
+    def _plot_phase2_logits(self, logits, output_tokens, original_prompt_len: int):
+        # Convert proxy to tensor if needed
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.tensor(logits)
+
+        # logits shape: [1, num_positions, vocab_size]
+        num_positions = logits.shape[1]
+        probs = F.softmax(logits[0].float(), dim=-1)  # [num_positions, vocab_size]
+
+        for pos in range(num_positions):
+            # Get actual generated token at this position
+            gen_idx = original_prompt_len + pos
+            if gen_idx < len(output_tokens):
+                actual_tok = self.model.tokenizer.decode([output_tokens[gen_idx].item()])
+            else:
+                actual_tok = "[N/A]"
+
+            # Top-5 predictions
+            top5_probs, top5_indices = torch.topk(probs[pos], k=5)
+            preds = ", ".join(
+                f"({self.model.tokenizer.decode([top5_indices[r].item()])!r}, {top5_probs[r].item():.4f})"
+                for r in range(5)
+            )
+            print(f"  pos {pos}: {actual_tok!r}  {preds}")
+
     # Extract residual activations from all layers starting at extract_start.
     def _extract_residual_activations(self, prompt: str, extract_start: int) -> dict:
         num_layers = self.num_layers
@@ -259,13 +294,15 @@ class ResidualStreamReplacementIntervention:
                 residual_list.append(
                     self.model.model.layers[layer_idx].output[0][:, extract_start:, :]
                 )
+            # Also save logits (norm + lm_head applied to last layer residuals)
+            logits = self.model.output.logits[:, extract_start:, :].save()
 
         print(f"  After trace: {len(residual_list)} entries")
         print(f"  First entry shape: {residual_list[0].shape}")
 
         # Convert to dict
         residual_acts = {i: residual_list[i] for i in range(len(residual_list))}
-        return residual_acts
+        return residual_acts, logits
 
 
 # Example usage
@@ -279,8 +316,8 @@ if __name__ == "__main__":
     print(model)
 
     # Define prompts - different contexts that should lead to different reasoning
-    original_prompt =  "x = 9, y = 12, z = y / x + 2. First plan steps to solve for z in words, then use steps to find z."
-    diff_prompt = "x = 4, y = 16, z = y / x + 2. First plan steps to solve for z in words, then use steps to find z."
+    original_prompt =  "x = 9, y = 12, z = y / x + 5. First plan steps to solve for z in words, then use steps to find z."
+    diff_prompt = "x = 4, y = 16, z = y / x + 5. First plan steps to solve for z in words, then use steps to find z."
 
     # Parameters
     x = 68  # Replace first 5 generated tokens' residual activations

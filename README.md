@@ -2,6 +2,8 @@
 
 This repository contains two experiments for investigating how language models use prefix information during text generation. Both experiments use the [nnsight](https://github.com/ndif-team/nnsight) library to intervene on model internals during generation.
 
+## See Results in results_plan_logits_other_prompt.md and logit_probs_visualization.png
+
 ## Setup
 
 ### Requirements
@@ -33,10 +35,12 @@ Or use a `.env` file with `python-dotenv`.
 **Mechanism:** After generating `unmasked_generations` tokens normally, all subsequent tokens have their attention masked so they cannot attend to positions `0:m` in the input. This is done by adding `-inf` to the attention scores for those positions.
 
 **Parameters:**
+
 - `m`: Number of prefix tokens to mask (e.g., mask "What is" in "What is the Eiffel Tower?")
 - `unmasked_generations`: Number of tokens to generate normally before masking begins
 
 **Example:**
+
 ```python
 from nnsight import LanguageModel
 from generate_prefix_masking import PrefixMaskIntervention
@@ -57,16 +61,18 @@ output = intervention(input_ids, max_new_tokens=8)
 
 ---
 
-### 2. Counterfactual Prefix (`generate_counterfactual_prefix.py`)
+### 2. Counterfactual Prefix - !Wrong Needs Custom Attention! (`generate_counterfactual_prefix.py`)
 
-**Goal:** Investigate what happens when specific generated tokens attend to an *alternate* prefix instead of the original, while all other tokens (including earlier generated tokens) continue to use the original prompt's representations.
+**Goal:** Investigate what happens when specific generated tokens attend to an _alternate_ prefix instead of the original, while all other tokens (including earlier generated tokens) continue to use the original prompt's representations.
 
 **Mechanism:**
+
 1. Pre-compute K/V representations for the alternate prefix by running it through the model
 2. Generate normally with the original prompt for `unmasked_generations` tokens
-3. For remaining tokens, manually recompute attention for *only* those query positions using the alternate K/V for positions `0:m`, then patch the attention output
+3. For remaining tokens, manually recompute attention for _only_ those query positions using the alternate K/V for positions `0:m`, then patch the attention output
 
-**Key Innovation:** Since nnsight doesn't use KV caching (the full attention is recomputed each step), simply swapping K/V would affect *all* tokens. Instead, we:
+**Key Innovation:** Since nnsight doesn't use KV caching (the full attention is recomputed each step), simply swapping K/V would affect _all_ tokens. Instead, we:
+
 - Extract Q, K, V from the attention module
 - Manually compute attention scores for only the affected query positions
 - Apply causal masking
@@ -76,11 +82,13 @@ output = intervention(input_ids, max_new_tokens=8)
 This ensures tokens before `warped_prefix_start` see the original prefix, while later tokens see the alternate prefix.
 
 **Parameters:**
+
 - `m`: Number of prefix tokens to swap
 - `unmasked_generations`: Number of tokens to generate normally before swapping begins
 - `alt_prefix_ids`: Token IDs for the alternate prefix
 
 **Example:**
+
 ```python
 from nnsight import LanguageModel
 from generate_counterfactual_prefix import CounterfactualPrefixIntervention
@@ -106,15 +114,15 @@ output = intervention(input_ids, alt_prefix_ids, max_new_tokens=20)
 
 ## Key Differences
 
-| Aspect | Prefix Masking | Counterfactual Prefix | Residual Stream Replacement |
-|--------|---------------|----------------------|---------------------------|
-| Intervention type | Mask attention (add `-inf`) | Manual attention recomputation | Direct residual stream patching |
-| What gets replaced | Attention weights (set to 0) | V projections for prefix positions | Full residual stream for generated tokens |
-| Source of replacement | N/A (blocking) | Alternate prefix alone | Diff prompt + generated tokens |
-| Affected positions | Prefix (0:m) | Prefix (0:m) | Generated tokens (prompt_len:prompt_len+x) |
-| When intervention occurs | During generation (steps >= unmasked) | During generation (steps >= unmasked) | After phase 1, ONE-TIME extraction + repeated patching |
-| Scope of impact | Attention mechanism only | Attention mechanism only | All downstream computation |
-| Research question | Is prefix info needed at generation time? | Can we redirect attention to different content? | Can the model compensate for mismatched residual representations? |
+| Aspect                   | Prefix Masking                            | Counterfactual Prefix                           | Residual Stream Replacement                                       |
+| ------------------------ | ----------------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------- |
+| Intervention type        | Mask attention (add `-inf`)               | Manual attention recomputation                  | Direct residual stream patching                                   |
+| What gets replaced       | Attention weights (set to 0)              | V projections for prefix positions              | Full residual stream for generated tokens                         |
+| Source of replacement    | N/A (blocking)                            | Alternate prefix alone                          | Diff prompt + generated tokens                                    |
+| Affected positions       | Prefix (0:m)                              | Prefix (0:m)                                    | Generated tokens (prompt_len:prompt_len+x)                        |
+| When intervention occurs | During generation (steps >= unmasked)     | During generation (steps >= unmasked)           | After phase 1, ONE-TIME extraction + repeated patching            |
+| Scope of impact          | Attention mechanism only                  | Attention mechanism only                        | All downstream computation                                        |
+| Research question        | Is prefix info needed at generation time? | Can we redirect attention to different content? | Can the model compensate for mismatched residual representations? |
 
 ## Technical Details
 
@@ -172,6 +180,7 @@ for step in range(x, max_new_tokens):
 ```
 
 Key points:
+
 - Extraction happens **once** after Phase 1 completes
 - The same extracted activations are reused for all subsequent generation steps
 - Patch positions `[original_prompt_len:original_prompt_len+x]` remain fixed as the sequence grows
@@ -184,17 +193,20 @@ Key points:
 **Goal:** Investigate what happens when the residual stream representations for the first `x` generated tokens come from a different context, while the original prompt context is preserved.
 
 **Mechanism:**
+
 1. Generate `x` tokens normally with the original prompt
 2. Extract residual stream activations from `diff_prompt + first_x_generated_tokens` at positions `[diff_prompt_len:diff_prompt_len+x]` across all layers (ONE TIME)
 3. For each subsequent token generation, patch the residual streams at FIXED positions `[original_prompt_len:original_prompt_len+x]` with the extracted activations
 4. These patched positions remain constant as new tokens are generated
 
 **Parameters:**
+
 - `x`: Number of generated token positions to replace (first x after prompt)
 - `diff_prompt`: Alternate prompt to extract residual activations from
 - `max_new_tokens`: Total number of tokens to generate
 
 **Example:**
+
 ```python
 from nnsight import LanguageModel
 from generate_residual_stream_replacement import ResidualStreamReplacementIntervention
