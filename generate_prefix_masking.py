@@ -3,72 +3,91 @@ from nnsight import LanguageModel, CONFIG
 import os
 from dotenv import load_dotenv
 
-
 # Cleanest approach: Use nnsight's intervention API
 class PrefixMaskIntervention:
     """
     Reusable intervention for prefix masking across any compatible model.
     """
-    def __init__(self, model: LanguageModel, m: int, unmasked_generations: int):
+    def __init__(self, model: LanguageModel, m: int, delimiter: str = "##"):
         self.model = model
         self.m = m
-        self.unmasked = unmasked_generations
+        self.delimiter = delimiter
+        self.unmasked = None  # Determined automatically via calibration
         self.x = None  # Set dynamically based on input length
-    
-    def __call__(self, input_ids: torch.Tensor, max_new_tokens: int = 20):
-        self.x = input_ids.shape[1] + self.unmasked
-        return self._generate(input_ids, max_new_tokens)
-    
-    def _generate(self, input_ids, max_new_tokens):
-        prompt = self.model.tokenizer.decode(input_ids[0])
 
-        with self.model.generate(prompt, max_new_tokens=max_new_tokens, remote=True) as tracer:
-            # First self.unmasked iterations: no masking
-            with tracer.iter[:self.unmasked]:
-                pass
+    def _calibrate(self, input_ids, calibration_tokens: int = 250):
+        """Generate once to find where the second delimiter appears, and set unmasked_generations."""
+        with self.model.generate(input_ids, do_sample=False, max_new_tokens=calibration_tokens, remote=False) as tracer:
+            calibration_output = self.model.generator.output.save()
 
-            # Remaining iterations: apply mask
-            with tracer.iter[self.unmasked:]:
+        prompt_len = input_ids.input_ids.shape[1]
+        generated_token_ids = calibration_output[0, prompt_len:]
+
+        # Walk through generated tokens, decoding each, to find the second delimiter
+        count = 0
+        for i, tok_id in enumerate(generated_token_ids):
+            tok_text = self.model.tokenizer.decode(tok_id)
+            if self.delimiter in tok_text:
+                count += 1
+                if count == 2:
+                    # Stop right before the second delimiter
+                    self.unmasked = i
+                    print(f"Calibration: found second '{self.delimiter}' at generated token {i}, setting unmasked_generations={self.unmasked}")
+                    return
+
+        raise ValueError(f"Second '{self.delimiter}' not found in first {calibration_tokens} generated tokens. "
+                         f"Try increasing calibration_tokens or checking the delimiter.")
+
+    def __call__(self, input_ids: torch.Tensor, max_additional_tokens: int = 20):
+        self._calibrate(input_ids)
+        self.x = input_ids.input_ids.shape[1] + self.unmasked
+        return self._generate(input_ids, max_additional_tokens)
+    
+    def _generate(self, input_ids, max_additional_tokens):
+
+        # Unmasked steps: generate the plan (up to second delimiter)
+        if self.unmasked > 0:
+            with self.model.generate(input_ids, do_sample=False, max_new_tokens=self.unmasked, remote=False) as tracer:
+                generated = self.model.generator.output.save()
+        else:
+            generated = input_ids.clone()
+
+        print(self.model.tokenizer.decode(generated[0], skip_special_characters=False))
+        generated_pp = self.model.tokenizer.decode(generated[0])
+        # Masked steps: generate beyond the plan with prompt masked
+        for step in range(max_additional_tokens):
+            with self.model.trace(generated_pp, do_sample=False, remote=False) as tracer:
                 for layer in self.model.model.layers:
-                    self._apply_mask(layer.self_attn, input_ids.shape[1] + max_new_tokens)
+                    attn_weights = layer.self_attn.source.attention_interface_0.source.torch_matmul_0.output
+                    attn_weights[:, :, self.x:, :self.m] = float('-inf') #prompt might be 1 shorter w/out eos (m-1)
+                    layer.self_attn.source.attention_interface_0.source.torch_matmul_0.output = attn_weights
 
-            output = self.model.generator.output.save()
-            print(output)
-    
+                next_token = self.model.lm_head.output[0, -1].argmax(dim=-1).save()
+            new_char = self.model.tokenizer.decode(next_token, skip_special_characters=False)
+            generated_pp += new_char
 
-        return output
-    
-    def _apply_mask(self, attn_module, seq_len):
-        """Apply prefix mask to attention scores."""
-        n = seq_len - 1
-        
-        # Create and apply mask
-        # Access attention weights - exact path depends on model
-        try:
-            weights = attn_module.o_proj.input[0][0]
-            mask = torch.zeros((1, 1, seq_len, seq_len))
-            if self.m > 0 and self.x <= n:
-                mask[:, :, self.x:n+1, :self.m] = float('-inf')
-            weights[:] = weights + mask
-        except Exception:
-            pass  # Handle models with different architecture
+        return generated_pp
 
 
 # Example usage
 if __name__ == "__main__":
     # Setup
     load_dotenv()
-    CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
-    CONFIG.API.HOST = "https://api.ndif.us"
-    CONFIG.save()
-    model = LanguageModel('meta-llama/Llama-3.1-8B')
+    model = LanguageModel('google/gemma-2-9b-it', dispatch=True, attn_implementation="eager")
     
-    prompt = "What is the Eiffle Tower?"
-    input_ids = model.tokenizer(prompt, return_tensors="pt").input_ids
+    prompt = "What is the Eiffel Tower?"
+    prompt =  "x = 4, y = 26, z = y / x + 5. First plan steps to solve for z in words, then use steps to find z."
+    unmasked_generations = 78
+    prompt =  "x = , y = 26, z = y / x + 5. First plan steps to solve for z in words, then use steps to find z."
+    prompt =  "x = 4, y = 26, z = y / x + 5. First plan steps to solve for z in words, then use steps to find z."
+    prompt = "I want to go to Bali, Indonesia and go swimming. First name the universal steps to plan any international trip (short list of short phrases), then use the steps to book the trip."
+
+    input_ids = model.tokenizer(prompt, return_tensors="pt", )
+
+    print(model.tokenizer.decode(input_ids.input_ids, skip_special_characters=False))
     
-    m = 2  # Mask first 2 tokens
-    unmasked_generations=5 # Allow next 5 tokens to attend to all prior tokens
-    
-    intervention = PrefixMaskIntervention(model, m, unmasked_generations)
-    output = intervention(input_ids, max_new_tokens=8)
-    print(f"Generated: {model.tokenizer.decode(output[0])}")
+    m = input_ids.input_ids.shape[1]  # Mask entire prompt
+
+    intervention = PrefixMaskIntervention(model, m)
+    output = intervention(input_ids, max_additional_tokens=150)
+    print(f"Generated: {output}")

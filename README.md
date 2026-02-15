@@ -2,7 +2,12 @@
 
 This repository contains two experiments for investigating how language models use prefix information during text generation. Both experiments use the [nnsight](https://github.com/ndif-team/nnsight) library to intervene on model internals during generation.
 
-## See Results in results_plan_logits_other_prompt.md and logit_probs_visualization.png
+## See Results in results
+
+Next
+
+1. result is torn!
+2. Patch activations accross clean and corrupted plan latents
 
 ## Setup
 
@@ -39,6 +44,47 @@ Or use a `.env` file with `python-dotenv`.
 - `m`: Number of prefix tokens to mask (e.g., mask "What is" in "What is the Eiffel Tower?")
 - `unmasked_generations`: Number of tokens to generate normally before masking begins
 
+````python
+n = seq_len                      # Total sequence length
+prior = self.m + self.unmasked   # Where masking STARTS (row-wise)
+self.m                           # First m tokens (e.g., prompt/question)
+self.unmasked                    # Tokens allowed to see the prompt (e.g., exact answer tokens)
+```
+## Visual Representation
+
+Say `seq_len=12`, `self.m=4` (prompt), `self.unmasked=3` (exact answer tokens):
+
+        Columns (Keys/Values being attended TO)
+
+        |←── self.m ──→|
+        |   (prompt)   |
+        0   1   2   3   4   5   6   7   8   9  10  11
+      ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
+    0 │   │   │   │   │   │   │   │   │   │   │   │   │ ┐
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │ self.m
+    1 │   │   │   │   │   │   │   │   │   │   │   │   │ │ (PROMPT tokens)
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │ CAN attend anywhere (trivial)
+    2 │   │   │   │   │   │   │   │   │   │   │   │   │ │
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ ┘
+    3 │   │   │   │   │   │   │   │   │   │   │   │   │
+R     ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤
+o   4 │   │   │   │   │   │   │   │   │   │   │   │   │ ┐
+w     ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │ self.unmasked (PLAN)
+s   5 │   │   │   │   │   │   │   │   │   │   │   │   │ │ CAN attend to PROMPT
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │
+(Q) 6 │   │   │   │   │   │   │   │   │   │   │   │   │ ┘
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ ← prior = self.m + self.unmasked
+    7 │ X │ X │ X │ X │   │   │   │   │   │   │   │   │ ┐
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │
+    8 │ X │ X │ X │ X │   │   │   │   │   │   │   │   │ │ SOLUTION
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │ CANNOT attend to PROMPT
+    9 │ X │ X │ X │ X │   │   │   │   │   │   │   │   │ │ CAN attend to PLAN
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │
+   10 │ X │ X │ X │ X │   │   │   │   │   │   │   │   │ │
+      ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┤ │
+   11 │ X │ X │ X │ X │   │   │   │   │   │   │   │   │ ┘
+      └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
+
 **Example:**
 
 ```python
@@ -55,7 +101,7 @@ unmasked_generations = 5  # Generate 5 tokens normally first
 
 intervention = PrefixMaskIntervention(model, m, unmasked_generations)
 output = intervention(input_ids, max_new_tokens=8)
-```
+````
 
 **What this tests:** How much information about the prefix is "baked in" to the latent representations of later tokens vs. retrieved via attention at generation time.
 
