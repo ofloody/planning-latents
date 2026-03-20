@@ -82,7 +82,7 @@ if __name__ == "__main__":
     prompt =  "x = 4, y = 26, z = y / x + 5. First plan steps to solve for z in words, then use steps to find z."
     prompt = "I want to go to Bali, Indonesia and go swimming. First name the universal steps to plan any international trip (short list of short phrases), then use the steps to book the trip."
 
-    input_ids = model.tokenizer(prompt, return_tensors="pt", )
+    input_ids = model.tokenizer(prompt, return_tensors="pt")
 
     print(model.tokenizer.decode(input_ids.input_ids, skip_special_characters=False))
     
